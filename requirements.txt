@@ -1,0 +1,7 @@
+pandas
+networkx
+pgmpy==0.1.26
+pyprojroot
+here
+
+

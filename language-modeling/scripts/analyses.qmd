@@ -1,0 +1,182 @@
+---
+title: Language modeling figures and analysis
+author: Ben Prystawski
+---
+
+# Setup
+
+## Imports
+
+```{r}
+library(tidyverse)
+library(glue)
+library(here)
+library(stringr)
+library(brms)
+# aesthetic stuff
+library(RColorBrewer)
+library(viridis)
+library(ggthemes)
+```
+
+## Constants
+
+```{r}
+set.seed(2025)
+EMBEDDING_DIMS <- c(256)
+DATASET_TYPES <- c("batch-with-separator")
+CHAINS <- 0:3
+SEEDS <- 2024:2028
+df_meta <- expand.grid(embedding_dim = EMBEDDING_DIMS, chain_num = CHAINS, random_seed = SEEDS, dataset_type = DATASET_TYPES)
+
+read_df <- function(dim, chain, seed, type) {
+    df_path <- here(glue("language-modeling/data/results/evaluation_model-embd-{dim}_chain-{chain}_dataset-{type}_seed-{seed}_criterion.csv"))
+    if (file.exists(df_path)[1]) {
+        print(glue("reading {df_path}"))
+        return(read_csv(df_path))
+    } else {
+        print(glue("File {df_path} does not exist"))
+        return(NA)
+    }
+}
+```
+
+## Data loading
+
+```{r}
+df <- df_meta |>
+    rowwise() |>
+    mutate(df = list(read_df(embedding_dim, chain_num, random_seed, dataset_type))) |>
+    filter(is.list(df)) |>
+    unnest(df)
+```
+
+How many chains of each type succeeded?
+```{r}
+df |>
+    group_by(embedding_dim, chain_num, dataset_type) |>
+    summarize(n_succeeded = length(unique(random_seed)))
+```
+
+
+# Preprocessing
+
+```{r}
+# convert data to tidy format
+df <- df |>
+    pivot_longer(cols = contains("layer"), names_to = "estimator_verbose", values_to = "estimate") |>
+    mutate(
+        estimator = str_extract(estimator_verbose, "(.+)(?=_layer_)"),
+        layer = str_extract(estimator_verbose, "(?<=_layer_)(.+)"),
+    )
+
+# compute accuracy and fix data types
+df <- df |>
+    mutate(accuracy = ifelse(true_prob == 1, estimate, 1 - estimate)) |>
+    mutate(layer = as.integer(layer)) |>
+    mutate(
+        dataset_type = "batch-with-separator",
+        estimator = factor(estimator, levels = c("markovian_scaff_gen"), labels = c("markovian scaff. gen."))
+    )
+```
+
+# Plots
+
+## Accuracy by distance and layer   
+
+```{r}
+chosen_layers <- c(2, 4, 6, 8)
+df_speeded_vs_unspeeded <- df |>
+    filter(layer %in% chosen_layers) |>
+    mutate(layer = factor(layer, levels = chosen_layers))
+ggplot(
+    data = df_speeded_vs_unspeeded,
+    mapping = aes(x = distance, y = accuracy, color = layer, fill = layer)
+) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    geom_point(alpha = 0.10, position = position_jitterdodge(jitter.height = 0, jitter.width = 0.15, dodge.width = 0.3)) +
+    stat_summary(
+        fun = mean,
+        geom = "line",
+    ) +
+    stat_summary(
+        fun.data = mean_cl_boot,
+        geom = "pointrange",
+        size = 1,
+        linewidth = 1,
+        shape = 21,
+        color = "black"
+    ) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+        x = "Distance between variables",
+        y = "Accuracy",
+    ) +
+    guides(fill = guide_legend(reverse = T), color = guide_none()) +
+    theme_tufte(base_size = 18) +
+    theme(
+        panel.grid.major.y = element_line(color = "grey", size = 0.5),
+        plot.margin = grid::unit(c(0, 0, 0, 0), "mm")
+    ) +
+    scale_colour_viridis_d() +
+    scale_fill_viridis_d()
+ggsave(here(glue("language-modeling/figures/lm-accuracy-by-distance.pdf")), width = 6, height = 4)
+```
+
+## Broken up by chain
+
+There are some interesting chain-level differences here, where chains 2 and 3 behave fairly 
+differently from 0 and 1.
+
+```{r}
+ggplot(
+    data = df,
+    mapping = aes(x = distance, y = accuracy, color = layer, group = layer)
+) +
+    facet_grid(~chain_num) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    geom_point(alpha = 0.2, position = position_jitter(height = 0, width = 0.1)) +
+    stat_summary(fun = mean, geom = "line") +
+    stat_summary(fun.data = mean_cl_boot, geom = "pointrange") +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+        x = "Distance",
+        y = "p(answer)",
+        title = "Accuracy by chain"
+    ) +
+    theme_hc() +
+    scale_color_viridis()
+ggsave(here(glue("language-modeling/figures/the_big_plot.png")), bg = "white", height = 12, width = 12)
+```
+
+
+# Model accuracy 
+
+Here, we will fit a Bayesian regression model to data from the language model,
+comparing read-outs from layers 4 and 6.
+
+```{r}
+df_chosen_layers <- chosen_layers <- c(4, 6)
+df_chosen_layers <- df |>
+    filter(layer %in% chosen_layers) |>
+    mutate(
+      layer = factor(layer, levels = chosen_layers),
+      non_local = distance > 1,
+      ) 
+```
+
+
+
+```{r}
+model_accuracy <- brm(
+  accuracy ~ 1 + non_local * layer + (1 + non_local | chain_num / random_seed),
+  data = df_chosen_layers,
+  iter = 5000,
+  chains = 4,
+  cores = 4,
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  file = here("data/fit-models/lm_accuracy_model.rds")
+)
+
+print(model_accuracy, digits = 3)
+```

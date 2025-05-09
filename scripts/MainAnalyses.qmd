@@ -1,0 +1,255 @@
+---
+title: Thinking in chains main analysis
+author: Ben Prystawski
+---
+
+# Imports and loading data
+
+
+```{r}
+library(tidyverse)
+library(here)
+library(glue)
+library(brms)
+library(coin)
+library(tidybayes)
+```
+
+Helper function to compute odds ratios
+
+```{r}
+set.seed(2025)
+get_ORs <- function(model) {
+  
+  # get the parameter names
+  parameter_names <- fixef(model) |> rownames()
+  parameter_names <- paste0("b_", parameter_names)
+  
+  or_data <- model |>
+    spread_draws(!!!syms(parameter_names)) |>
+    pivot_longer(
+      cols = all_of(parameter_names),
+      names_to = "parameter",
+      values_to = "estimate"
+    ) %>%
+    mutate(
+      OR = exp(estimate),
+    )
+  
+  or_summary <- or_data |>
+    group_by(parameter) |>
+    summarize(
+      median = median(OR),
+      lower = quantile(OR, 0.025),
+      upper = quantile(OR, 0.975)
+    )
+  
+  return(or_summary)
+}
+```
+
+Specify the name of the data files to read from:
+
+```{r}
+EXP_VERSION <- "final"
+```
+
+Load preprocessed data:
+
+```{r}
+df_queries <- read_csv(here(glue("data/processed/queries-{EXP_VERSION}.csv")))
+query_order <- df_queries |>
+    arrange(condition) |>
+    pull(pid) |>
+    unique()
+df_queries <- df_queries |>
+    mutate(pid = factor(pid, levels=query_order)) # make sure participant id is treated as a factor
+df_train <- read_csv(here(glue("data/processed/train-{EXP_VERSION}.csv")))
+df_survey <- read_csv(here(glue("data/processed/survey-{EXP_VERSION}.csv")))
+n_pre_exclusion <- df_queries |> select(pid) |> unique() |> nrow()
+print(paste0("n participants with data: ", n_pre_exclusion, ", n with data lost: ", 184 - n_pre_exclusion))
+```
+
+# Exclusions and processing
+
+Determine the participants who took too long to get to criterion, had too many
+ultra-fast responses, were colorblind, or took notes.
+
+```{r}
+# participants who took too long to get to criterion
+df_n_train_trials <- df_train |>
+  group_by(pid) |>
+  summarize(n_train_trials = n())
+# participants who had too many ultra-fast responses
+df_too_fast_responses <- df_queries |>
+  group_by(pid) |>
+  summarize(n_fast_responses = sum(response_time_ms < 100, na.rm=T))
+# colorblind participants
+df_colorblind <- df_survey |>
+  filter(question == "colorblind") |>
+  mutate(is_colorblind = response == "Yes") |>
+  select(pid, is_colorblind)
+# participants who took notes
+df_took_notes <- df_survey |>
+  filter(question == "notes") |>
+  mutate(took_notes = response == "Yes") |>
+  select(pid, took_notes)
+
+# merge and come up with a final list
+pids_to_exclude <- df_n_train_trials |>
+  merge(df_too_fast_responses, on=pid) |>
+  merge(df_colorblind, on=pid) |>
+  merge(df_took_notes, on=pid) |>
+  filter(n_fast_responses >= 10 | n_train_trials > 320 | is_colorblind | took_notes) |>
+  pull(pid)
+
+
+# print the exclusion numbers
+print(paste0("n colorblind: ", df_colorblind |> filter(is_colorblind) |> nrow()))
+print(paste0("n took notes: ", df_took_notes |> filter(took_notes) |> nrow()))
+print(paste0("n too fast: ", df_too_fast_responses |> filter(n_fast_responses >= 10) |> nrow()))
+print(paste0("n too long training: ", df_n_train_trials |> filter(n_train_trials >= 320) |> nrow()))
+print(paste0("total n excluded: ", length(pids_to_exclude)))
+
+# filter out data from excluded participants and apply final preprocessing steps
+df_queries <- df_queries |>
+  filter(!(pid %in% pids_to_exclude)) |>
+  group_by(pid) |>
+  mutate(
+    condition = factor(condition),
+    stimulus_condition = factor(stimulus_condition),
+    response_time_ms = ifelse(is.na(response_time_ms), 5000, response_time_ms),
+    response_time_s = response_time_ms / 1000,
+    trial_index = trial_index - min(trial_index),
+    non_local = factor(distance > 1, levels = c(FALSE, TRUE), labels = c("local", "non-local"))
+    )
+```
+
+# Compute summary statistics
+
+First, we'll compute the number of participants in each condition post-exclusions
+
+```{r}
+df_queries |>
+  select(pid, condition) |>
+  unique() |>
+  group_by(condition) |>
+  summarize(n_participants = n())
+```
+
+How long did people take in the last two blocks of the train trials?
+
+```{r}
+options(digits=3)
+df_train |>
+  filter(!pid %in% pids_to_exclude) |>
+  mutate(response_time_s = response_time_ms / 1000) |>
+  group_by(condition, pid) |>
+  filter(trial_index > max(trial_index) - 64) |>
+  ungroup() |>
+  group_by(condition) |>
+  summarize(
+    median_rt_s = median(response_time_s),
+    iqr_rt_s = IQR(response_time_s),
+    n_trials = n()
+  )
+```
+
+Next, we'll run a manipulation check: did people actually take less time in the speeded condition?
+
+```{r}
+df_queries |>
+  group_by(condition) |>
+  summarize(
+    median_rt_s = median(response_time_s),
+    iqr_rt_s = IQR(response_time_s)
+    )
+
+permutation_test_result <- oneway_test(
+    response_time_ms ~ condition,
+    data = df_queries,
+    distribution = approximate(nresample = 100000),
+    alternative = "two.sided"
+)
+print(permutation_test_result)
+```
+
+# Run main analyses
+
+First, we will fit a model to predict correctness based on locality, condition, 
+and their interaction. We are primarily interested by an interaction between the
+two.
+
+```{r}
+model_correctness <- brm(
+    is_correct ~ 1 + non_local * condition + (1 + non_local | stimulus_condition / pid),
+    family = bernoulli("logit"),
+    iter = 5000,
+    chains = 5,
+    cores = 5,
+    control = list(adapt_delta = 0.99),
+    data = df_queries,
+    file = here(glue("data/fit-models/model-correctness-{EXP_VERSION}.rds")),
+)
+summary(model_correctness)
+get_ORs(model_correctness)
+```
+
+Next, we will fit a model that predicts participants' response time using locality.
+Here, we only look at data from participants in the unspeeded condition. We 
+hypothesize that there will be a main effect of distance.
+
+```{r}
+model_response_time <- brm(
+    response_time_s ~ 1 + non_local + (1 + non_local | stimulus_condition / pid),
+    data = df_queries |> filter(condition == "unspeeded"),
+    control = list(adapt_delta = 0.9, max_treedepth=15),
+    iter = 5000,
+    chains = 5,
+    cores = 5,
+    file = here(glue("data/fit-models/model-response-time-{EXP_VERSION}.rds")),
+)
+summary(model_response_time)
+```
+
+## Secondary analyses
+
+This section has analyses by distance among the non-local pairs of variables. We
+will look at both accuracy and response time.
+
+```{r}
+df_non_local_queries <- df_queries |>
+  filter(non_local == "non-local") |>
+  mutate(dist_gt_2 = factor(distance > 2, levels = c(FALSE, TRUE), labels = c("2", "gt 2"))) |>
+  mutate(response_time_s = response_time_ms / 1000)
+```
+
+```{r}
+model_correctness_non_local <- brm(
+    is_correct ~ 1 + dist_gt_2 * condition + (1 + dist_gt_2 | stimulus_condition / pid),
+    family = bernoulli("logit"),
+    iter = 5000,
+    chains = 5,
+    cores = 5,
+    control = list(adapt_delta = 0.99),
+    data = df_non_local_queries,
+    file = here(glue("data/fit-models/model-correctness-non-local-{EXP_VERSION}.rds")),
+)
+summary(model_correctness_non_local)
+get_ORs(model_correctness_non_local)
+```
+
+Now compare response times between pairs of distance two and >2
+
+```{r}
+model_response_time_non_local <- brm(
+    response_time_s ~ 1 + dist_gt_2 + (1 + dist_gt_2 | stimulus_condition / pid),
+    iter = 5000,
+    chains = 5,
+    cores = 5,
+    control = list(adapt_delta = 0.9),
+    data = df_non_local_queries |> filter(condition == "unspeeded"),
+    file = here(glue("data/fit-models/model-response_time-non-local-{EXP_VERSION}.rds")),
+)
+summary(model_response_time_non_local)
+```

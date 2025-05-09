@@ -1,0 +1,134 @@
+---
+title: Make illustrative plots
+author: Ben Prystawski
+execute:
+    output: false
+---
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(here)
+library(glue)
+library(ggthemes)
+library(viridis)
+library(latex2exp)
+library(patchwork)
+library(ggpubr)
+```
+
+```{r}
+compute_p_correct <- function(n, p) {
+    p_correct <- dbinom(0:n, n, p)
+    # sum the even indices
+    return(sum(p_correct[seq(1, length(p_correct), 2)]))
+}
+
+# Here, we're just using hand-chosen probabilities to illustrate the point.
+p_correct_dichotomous <- function(n, condition) {
+    if (condition == "unspeeded") {
+        return(0.9 - 0.01 * n)
+    } else {
+        if (n == 1) {
+            return(0.85)
+        } else {
+            return(0.5)
+        }
+    }
+}
+```
+
+# Compute probabilities
+
+Here, we'll compute probabilities for the noisy step-wise reasoning model and the dichotomous account.
+
+```{r}
+df_sims <- expand.grid(distance = 1:4, p_error = seq(0, 0.5, 0.05)) |>
+    mutate(p_correct = map2_dbl(distance, p_error, compute_p_correct)) |>
+    mutate(model = "Noisy step-wise reasoning")
+df_dichotomous <- expand.grid(distance = 1:4, condition = c("speeded", "unspeeded")) |>
+    mutate(p_correct = map2_dbl(distance, condition, p_correct_dichotomous)) |>
+    mutate(model = "Dichotomous")
+df_all <- bind_rows(df_sims, df_dichotomous)
+```
+
+```{r}
+p1 <- ggplot(
+    data = df_sims,
+    mapping = aes(x = distance, y = p_correct, color = p_error, group = p_error)
+) +
+    geom_line(size = 1) +
+    geom_point(size = 3) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+        title = "Noisy Step-wise Reasoning",
+        x = "Distance between variables",
+        y = "Accuracy",
+        color = TeX("$p_e$")
+    ) +
+    theme_tufte(base_size = 20) +
+    scale_color_viridis_c(direction = -1, option = "viridis") +
+    theme(
+        panel.grid.major.y = element_line(color = "darkgrey", size = 0.5),
+        legend.position = c(0.6, 0.16),
+        legend.direction = "horizontal",
+        legend.key.width = unit(1, "cm"),
+        legend.text = element_text(size = 14),
+        plot.title = element_text(size = 20),
+        # axis.title.x = element_blank(),  # Remove x axis label
+        # axis.title.y = element_blank()   # Remove y axis label
+    )
+p1
+```
+
+# Dichotomous model
+
+```{r}
+p2 <- ggplot(
+    data = df_dichotomous,
+    mapping = aes(x = distance, y = p_correct, color = condition, group = condition)
+) +
+    geom_line(size = 1) +
+    geom_point(size = 3) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+        title = "Dichotomous",
+        x = "Distance between variables",
+        y = "Accuracy",
+        color = TeX("$p_e$")
+    ) +
+    annotate(
+        "text",
+        x = 3,
+        y = 0.59,
+        label = "No reasoning",
+        color = "#e41a1c",
+        size = 8
+    ) +
+    annotate(
+        "text",
+        x = 2.3,
+        y = 0.8,
+        label = "Reasoning",
+        color = "#377eb8",
+        size = 8
+    ) +
+    theme_tufte(base_size = 20) +
+    scale_color_brewer(palette = "Set1") +
+    theme(
+        panel.grid.major.y = element_line(color = "darkgrey", size = 0.5),
+        legend.position = "none",
+        plot.title = element_text(size = 20),
+    )
+p2
+```
+
+```{r}
+p2 + p1 +
+    plot_layout(axis_titles = "collect") &
+    theme(plot.margin = grid::unit(c(0, 0, 0, 0), "mm"))
+
+ggsave(here("figures/theory-comparison.pdf"), width = 8, height = 5)
+```
+

@@ -1,0 +1,162 @@
+---
+title: Local statistical learning analysis
+author: Ben Prystawski
+execute:
+    output: false
+---
+
+This file contains the main analyses of the locally-structured statistical learning experiment.
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(here)
+library(glue)
+library(ggthemes)
+library(RColorBrewer)
+```
+
+```{r}
+EXP_VERSION <- "final"
+TIME_LIMIT_MS <- 5000
+FIT_MODELS <- TRUE
+FIGURE_EXTENSION <- "pdf"
+```
+
+```{r}
+# Load data
+df_queries <- read_csv(here(glue("data/processed/queries-{EXP_VERSION}.csv")))
+query_order <- df_queries |>
+    arrange(condition) |>
+    pull(pid) |>
+    unique()
+df_queries <- df_queries |>
+    mutate(pid = factor(pid, levels = query_order)) # make sure participant id is treated as a factor
+df_train <- read_csv(here(glue("data/processed/train-{EXP_VERSION}.csv")))
+df_survey <- read_csv(here(glue("data/processed/survey-{EXP_VERSION}.csv")))
+```
+
+## Process exclusions
+
+```{r}
+df_n_train_trials <- df_train |>
+    group_by(pid) |>
+    summarize(n_train_trials = n())
+# come up with a list of participant IDs to exclude
+df_train_trials <- df_train |>
+    group_by(pid) |>
+    summarize(n_train_trials = n())
+df_too_fast_responses <- df_queries |>
+    group_by(pid) |>
+    summarize(n_fast_responses = sum(response_time_ms < 100, na.rm = T))
+df_colorblind <- df_survey |>
+    filter(question == "colorblind") |>
+    mutate(is_colorblind = response == "Yes") |>
+    select(pid, is_colorblind)
+pids_to_exclude <- df_train_trials |>
+    merge(df_too_fast_responses, on = pid) |>
+    merge(df_colorblind, on = pid) |>
+    filter(n_fast_responses >= 10 | n_train_trials > 320 | is_colorblind) |>
+    pull(pid)
+df_queries <- df_queries |>
+    filter(!(pid %in% pids_to_exclude)) |>
+    group_by(pid) |>
+    mutate(
+        stimulus_condition = factor(stimulus_condition),
+        response_time_ms = ifelse(is.na(response_time_ms), 5000, response_time_ms),
+        trial_index = trial_index - min(trial_index),
+        non_local = factor(distance > 1, levels = c(FALSE, TRUE), labels = c("local", "non-local"))
+    )
+```
+
+
+# Plots
+
+## Accuracy
+
+```{r}
+#| output: true
+ggplot(
+    data = df_queries,
+    mapping = aes(
+        x = distance,
+        y = is_correct,
+        color = condition,
+        group = condition
+    )
+) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", size = 1) +
+    stat_summary(
+        fun = mean,
+        geom = "line",
+        size = 1,
+        position = position_dodge(0.07)
+    ) +
+    stat_summary(
+        fun.data = mean_cl_boot,
+        geom = "pointrange",
+        size = 1,
+        linewidth = 1,
+        position = position_dodge(0.07)
+    ) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+        x = "Distance between variables",
+        y = "Accuracy",
+    ) +
+    annotate("text", x = 2.55, y = 0.81, label = "unspeeded", size = 7, color = "#d95f02") +
+    annotate("text", x = 2.75, y = 0.38, label = "speeded", size = 7, color = "#1b9e77") +
+    theme_tufte(base_size = 18) +
+    scale_color_brewer(palette = "Dark2") +
+    theme(
+        legend.position = "none",
+        panel.grid.major.y = element_line(color = "darkgrey", size = 0.5),
+        plot.margin = grid::unit(c(0, 0, 0, 0), "mm")
+    )
+
+ggsave(here(glue("figures/accuracy-by-distance-{EXP_VERSION}.{FIGURE_EXTENSION}")), width = 6, height = 4)
+```
+
+## Response time
+
+```{r}
+#| output: true
+ggplot(
+    data = df_queries |> filter(condition == "unspeeded"),
+    mapping = aes(
+        x = distance,
+        y = response_time_ms / 1000,
+        group = 1,
+    )
+) +
+    geom_point(
+        alpha = 0.2,
+        position = position_jitter(height = 0, width = 0.1),
+        size = 2,
+        color = brewer.pal(3, "Set1")[2]
+    ) +
+    stat_summary(
+        fun = mean,
+        geom = "line",
+        size = 1,
+        color = brewer.pal(3, "Set1")[2]
+    ) +
+    stat_summary(
+        fun.data = mean_cl_boot,
+        geom = "pointrange",
+        size = 1,
+        fill = brewer.pal(3, "Set1")[2],
+        color = "black",
+        linewidth = 1,
+        shape = 21
+    ) +
+    labs(
+        x = "Distance betwen variables",
+        y = "Response time (s)",
+        color = "condition"
+    ) +
+    coord_cartesian(ylim = c(0, 25)) +
+    theme_tufte(base_size = 18)
+ggsave(here(glue("figures/response-times-by-distance-{EXP_VERSION}.{FIGURE_EXTENSION}")), width = 6, height = 4)
+```
