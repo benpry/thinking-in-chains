@@ -18,3 +18,6 @@ pip install -e .
 
 Next, you can run `scripts/model_training_sweep.py` and `scripts/model_evaluation_sweep.py` to train
 all of the models and extract probability estimates from them.
+
+`scripts/analysis.qmd` in the `language-modeling` directory makes Figure 5 and runs the regression
+on the language model data.
